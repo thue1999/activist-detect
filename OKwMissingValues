@@ -1,0 +1,453 @@
+import csv
+import logging
+from pathlib import Path
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import xgboost as xgb
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+                             f1_score, classification_report, confusion_matrix)
+from sklearn.model_selection import train_test_split
+from sklearn.neighbors import NearestNeighbors
+from sklearn.pipeline import Pipeline
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Paths and file names
+data_dir = Path(r"C:\Users\16036\OneDrive\Desktop\Investor Sight\Vulnerability")
+stata_dir = data_dir
+output_dir = data_dir
+data_file = "Merged_dataset-2024-04-04.dta"
+
+# Constants
+TARGET_VAR = "F1_Factset_activism"
+INDUSTRY_VAR = "sic_1_digit"
+CLUSTER_ON = ["ln_mkv"]
+CUTOFF_YEAR = 2015
+MAX_MISSING = 0.25
+MAX_CORRELATION = 0.85
+MODEL_LABEL = "xgb"
+NEIGHBORS = 20
+DATA_FIELDS = [
+    TARGET_VAR,
+    INDUSTRY_VAR,
+    "year",
+    "gvkey",
+    "ln_mkv",
+    "activist_share_pct",
+    "avg_networksize",
+    "avg_support_director",
+    "avg_support_management",
+    "board_independent_ratio",
+    "cash_holding",
+    "ceo_appoint",
+    "ceo_turnover",
+    "ctype1",
+    "ctype2",
+    "ctype4",
+    "ctype21",
+    "current_ratio",
+    "debt_ratio",
+    "ded_pct",
+    "instown_hhi",
+    "intan_ratio",
+    "ln_at",
+    "ln_capx",
+    "ln_rd",
+    "ln_xad",
+    "num_rec",
+    "prstkc",
+    "risk_taking_value",
+    "roa",
+    "roa_2",
+    "roa_3",
+    "roe",
+    "roe_2",
+    "roe_3",
+    "short_ratio",
+    "stock_ret",
+    "tobin_q",
+    "tra_pct",
+    "w_environment",
+    "w_governance",
+    "w_social",
+    "xsga_ratio",
+    "yearfounded",
+    "t_num_employees"
+]
+
+DATA_FIELDS = list(dict.fromkeys(DATA_FIELDS))
+ID_FIELDS = DATA_FIELDS[:5]
+
+# Hyperparameters for XGBoost
+param_grid = {
+    'colsample_bytree': 0.9,
+    'gamma': 0.2,
+    'learning_rate': 0.2,
+    'max_depth': 3,
+    'min_child_weight': 1,
+    'n_estimators': 100,
+    'reg_alpha': 0.1,
+    'reg_lambda': 0,
+    'subsample': 0.8
+}
+
+'''class DataProcessor:
+    def __init__(self, data_file, data_fields, id_fields, max_missing, max_corr, cutoff_year=CUTOFF_YEAR):
+        self.data_file = data_file
+        self.data_fields = data_fields
+        self.id_fields = id_fields
+        self.max_missing = max_missing
+        self.max_corr = max_corr
+        self.cutoff_year = cutoff_year
+        logging.info(f"DataProcessor initialized with {self.data_file}")
+
+    def prepare_data(self, data):
+        logging.info(f"Removing rows missing more than {self.max_missing * 100}% of data")
+        start_rows = len(data)
+        data = data.dropna(thresh=data.shape[1] * (1 - self.max_missing), axis=0)
+        end_rows = len(data)
+        logging.info(f"Dropped {start_rows - end_rows} rows")
+
+        logging.info("Removing columns that are highly correlated")
+        corr_matrix = data.corr(numeric_only=True).abs()
+        upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+        columns_to_drop = [column for column in upper.columns if any(upper[column] > self.max_corr)]
+        columns_to_drop = [c for c in columns_to_drop if c not in self.id_fields]
+        data = data.drop(columns_to_drop, axis=1)
+        for idx, c in enumerate(columns_to_drop):
+            logging.info(f"{idx + 1:02d} Dropped column {c}")
+
+        return data
+
+    def load_data(self):
+        logging.info(f"Reading {self.data_file} into a DataFrame")
+        df = pd.read_stata(self.data_file)
+        logging.info(f"Data loaded with {df.shape[0]} rows and {df.shape[1]} columns")
+
+        df = df[self.data_fields]
+        logging.info(f"Data filtered for {len(self.data_fields)} fields")
+
+        logging.info(f"Data filtered for year >= {self.cutoff_year}")
+        df = df[df["year"] >= self.cutoff_year]
+
+        logging.info("Removing records with missing ID fields")
+        start_rows = len(df)
+        df = df.dropna(subset=self.id_fields)
+        end_rows = len(df)
+        logging.info(f"Dropped {start_rows - end_rows} rows")
+
+        df = self.prepare_data(df)
+        return df'''
+
+class DataProcessor:
+    def __init__(self, data_file, data_fields, id_fields, cutoff_year=CUTOFF_YEAR):
+        self.data_file = data_file
+        self.data_fields = data_fields
+        self.id_fields = id_fields
+        self.cutoff_year = cutoff_year
+        logging.info(f"DataProcessor initialized with {self.data_file}")
+
+    def prepare_data(self, data):
+        # Log the initial data state
+        start_rows = len(data)
+        logging.info("Removing rows with missing 'ln_mkv'")
+
+        # Drop rows where 'ln_mkv' is NaN
+        data = data.dropna(subset=['ln_mkv'])
+        
+        # Log how many rows were dropped
+        end_rows = len(data)
+        logging.info(f"Dropped {start_rows - end_rows} rows due to missing 'ln_mkv'")
+
+        return data
+
+    def load_data(self):
+        logging.info(f"Reading {self.data_file} into a DataFrame")
+        df = pd.read_stata(self.data_file)
+        logging.info(f"Data loaded with {df.shape[0]} rows and {df.shape[1]} columns")
+
+        df = df[self.data_fields]
+        logging.info(f"Data filtered for {len(self.data_fields)} fields")
+
+        logging.info(f"Data filtered for year >= {self.cutoff_year}")
+        df = df[df["year"] >= self.cutoff_year]
+
+        logging.info("Preparation and filtering complete, proceeding without removing missing values.")
+        df = self.prepare_data(df)
+        return df
+
+
+class DataMatcher(BaseEstimator, TransformerMixin):
+    def __init__(self, target_var, id_fields, group_fields=[INDUSTRY_VAR, 'year'], cluster_on=['ln_mkv'], neighbors=1):
+        self.target_var = target_var
+        self.id_fields = id_fields
+        self.group_fields = group_fields
+        self.cluster_on = cluster_on
+        self.nearest_neighbors = neighbors
+
+    def create_groups(self, df):
+        groups = df.groupby(self.group_fields, group_keys=False, observed=False)
+        return groups
+
+    def match_simple(self, group):
+        logging.info(f"Matching in group with size: {len(group)}")
+        minority = group[group[self.target_var] == 1]
+        majority = group[group[self.target_var] == 0]
+
+        if minority.empty or majority.empty:
+            logging.info("Insufficient data for matching in this group.")
+            return pd.DataFrame()
+
+        nn = NearestNeighbors(n_neighbors=min(len(majority), self.nearest_neighbors))
+        nn.fit(majority[self.cluster_on])
+        distances, indices = nn.kneighbors(minority[self.cluster_on])
+        matched_majority_indices = indices.flatten()
+
+        matched_majority = majority.iloc[matched_majority_indices]
+        matched_samples = pd.concat([minority, matched_majority]).drop_duplicates()
+
+        logging.info(f"Matched samples size: {len(matched_samples)}")
+        return matched_samples
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        groups = self.create_groups(X)
+        matched_samples = pd.DataFrame()
+        for name, group in groups:
+            matched_group = self.match_simple(group)
+            matched_samples = pd.concat([matched_samples, matched_group], ignore_index=True)
+        logging.info(f"Total matched data size after processing all groups: {len(matched_samples)}")
+        return matched_samples
+
+
+class ClassificationReport:
+    def __init__(self, model, model_step, X_test, y_test):
+        self.model = model
+        self.model_step = model_step
+        self.X_test = X_test
+        self.y_test = y_test
+        self.predictions = model.predict(X_test)
+
+    def value_counts(self):
+        return self.y_test.value_counts()
+    
+    def total_points(self):
+        return len(self.y_test)
+    
+    def count_ones(self):
+        return (self.y_test == 1).sum()
+
+    def accuracy_scores(self):
+        return accuracy_score(self.y_test, self.predictions)
+
+    def precision_scores_0(self):
+        p = precision_score(self.y_test, self.predictions, average=None, zero_division=1)
+        return p[0] if len(p) > 0 else None
+
+    def precision_scores_1(self):
+        p = precision_score(self.y_test, self.predictions, average=None, zero_division=1)
+        return p[1] if len(p) > 1 else None
+
+    def precision_scores_macro(self):
+        return precision_score(self.y_test, self.predictions, average='macro', zero_division=1)
+
+    def precision_scores_weighted(self):
+        return precision_score(self.y_test, self.predictions, average='weighted', zero_division=1)
+
+    def recall_scores_0(self):
+        r = recall_score(self.y_test, self.predictions, average=None, zero_division=1)
+        return r[0] if len(r) > 0 else None
+
+    def recall_scores_1(self):
+        r = recall_score(self.y_test, self.predictions, average=None, zero_division=1)
+        return r[1] if len(r) > 1 else None
+
+    def recall_scores_macro(self):
+        return recall_score(self.y_test, self.predictions, average='macro', zero_division=1)
+
+    def recall_scores_weighted(self):
+        return recall_score(self.y_test, self.predictions, average='weighted', zero_division=1)
+
+    def f1_scores_0(self):
+        f = f1_score(self.y_test, self.predictions, average=None, zero_division=1)
+        return f[0] if len(f) > 0 else None
+
+    def f1_scores_1(self):
+        f = f1_score(self.y_test, self.predictions, average=None, zero_division=1)
+        return f[1] if len(f) > 1 else None
+
+    def f1_scores_macro(self):
+        return f1_score(self.y_test, self.predictions, average='macro', zero_division=1)
+
+    def f1_scores_weighted(self):
+        return f1_score(self.y_test, self.predictions, average='weighted', zero_division=1)
+
+    def confusion_mat(self):
+        return confusion_matrix(self.y_test, self.predictions)
+
+    def feature_importance(self):
+        classifier = self.model.named_steps[self.model_step]
+        feature_importance = pd.Series(classifier.feature_importances_, index=self.X_test.columns)
+        return feature_importance.sort_values(ascending=False)
+
+    def generate_report(self, title, output_path):
+        with open(output_path, 'a', encoding='utf-8') as f:
+            f.write("=" * 100 + "\n")
+            f.write(f"{title}\n")
+            f.write("=" * 100 + "\n")
+            f.write("Value Counts:\n")
+            f.write(str(self.value_counts()))
+            f.write("\n\nConfusion Matrix:\n")
+            f.write(str(self.confusion_mat()))
+            f.write("\n\nClassification Report:\n")
+            f.write(str(classification_report(self.y_test, self.predictions, zero_division=1)))
+            f.write("\n\nFeature Importance:\n")
+            for feature, importance in self.feature_importance().items():
+                f.write(f"{feature}: {importance: 6.4f}\n")
+            f.write("\n\n")
+
+    def record_results(self, title, output_path, industry, neighbors, train_total_points, train_count_ones):
+        new_file = not Path(output_path).exists()
+        file_mode = 'w' if new_file else 'a'
+
+        with open(output_path, file_mode, encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=['timestamp',
+                                                   'model',
+                                                   'industry',
+                                                   'neighbors',
+                                                   'precision 0',
+                                                   'precision 1',
+                                                   'macro average precision',
+                                                   'weighted average precision',
+                                                   'recall 0',
+                                                   'recall 1',
+                                                   'macro average recall',
+                                                   'weighted average recall',
+                                                   'f1 0',
+                                                   'f1 1',
+                                                   'macro average f1',
+                                                   'weighted average f1',
+                                                   'train total points',
+                                                   'train count ones',
+                                                   'test total points',
+                                                   'test count ones',
+                                                   'accuracy'])
+            if new_file:
+                writer.writeheader()
+            writer.writerow({'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                             'model': title,
+                             'industry': industry,
+                             'neighbors': neighbors,
+                             'precision 0': self.precision_scores_0(),
+                             'precision 1': self.precision_scores_1(),
+                             'macro average precision': self.precision_scores_macro(),
+                             'weighted average precision': self.precision_scores_weighted(),
+                             'recall 0': self.recall_scores_0(),
+                             'recall 1': self.recall_scores_1(),
+                             'macro average recall': self.recall_scores_macro(),
+                             'weighted average recall': self.recall_scores_weighted(),
+                             'f1 0': self.f1_scores_0(),
+                             'f1 1': self.f1_scores_1(),
+                             'macro average f1': self.f1_scores_macro(),
+                             'weighted average f1': self.f1_scores_weighted(),
+                             'train total points': train_total_points,
+                             'train count ones': train_count_ones,
+                             'test total points': self.total_points(),
+                             'test count ones': self.count_ones(),
+                             'accuracy': self.accuracy_scores()})
+
+def train_evaluate_model(train_features, test_features, train_labels, test_labels, pipeline, title, output_path, result_path, industry, neighbors):
+    pipeline.fit(train_features, train_labels)
+
+    # Create the ClassificationReport instance with test data
+    report = ClassificationReport(pipeline, MODEL_LABEL, test_features, test_labels)
+    report.generate_report(title, output_path)
+
+    # Calculating training set metrics
+    train_total_points = len(train_labels)
+    train_count_ones = (train_labels == 1).sum()
+
+    # Record results now also includes training set metrics
+    report.record_results(title, result_path, industry, neighbors, train_total_points, train_count_ones)
+
+
+def main():
+    stata_file_path = stata_dir / data_file
+    logging.info(f"Loading data from {stata_file_path}")
+    #df = DataProcessor(stata_file_path, DATA_FIELDS, ID_FIELDS, MAX_MISSING, MAX_CORRELATION, cutoff_year=CUTOFF_YEAR).load_data()
+    df = DataProcessor(stata_file_path, DATA_FIELDS, ID_FIELDS, cutoff_year=CUTOFF_YEAR).load_data()
+
+    # Separate the data from 2022 as the testing set
+    test_data = df[df['year'] == 2022.0]
+    train_data = df[df['year'] != 2022.0]
+
+    result_path = output_dir / "model_resultsFacset2022.csv"
+    pipeline = Pipeline([(MODEL_LABEL, xgb.XGBClassifier(**param_grid))])
+
+    # Process each industry within the training data
+    industries = train_data[INDUSTRY_VAR].unique()
+    for industry in sorted(industries):
+        logging.info(f"Running model on {industry} industry")
+        df_industry = train_data[train_data[INDUSTRY_VAR] == industry]
+
+        industry_test_data = test_data[test_data[INDUSTRY_VAR] == industry]
+        test_labels = industry_test_data[TARGET_VAR]
+        test_features = industry_test_data.drop([TARGET_VAR, INDUSTRY_VAR], axis=1)
+
+        output_path = output_dir / f"{industry}_NeighborsFacset_report.txt"
+
+        for n in range(1, NEIGHBORS + 1):
+            logging.info(f"Creating matched dataset: {n} neighbors for {industry} industry")
+            matched_train_data = DataMatcher(target_var=TARGET_VAR, id_fields=ID_FIELDS, cluster_on=CLUSTER_ON, neighbors=n).fit_transform(df_industry)
+
+            if matched_train_data.empty:
+                logging.warning(f"No matched data for {industry} industry with {n} neighbors")
+                continue
+
+            train_labels = matched_train_data[TARGET_VAR]
+            train_features = matched_train_data.drop([TARGET_VAR, INDUSTRY_VAR], axis=1)
+
+            title = f"XGBoost Model on {data_file} for {industry} (Neighbors={n})"
+            try:
+                train_evaluate_model(train_features, test_features, train_labels, test_labels, pipeline, title, output_path, result_path, industry, n)
+            except Exception as e:
+                logging.error(f"Error running model on {industry} industry with {n} neighbors: {e}")
+
+
+    # Run the model on ALL industries after looping through each industry and neighbor
+    for n in range(1, NEIGHBORS + 1):
+        logging.info(f"Creating matched dataset: {n} neighbors for ALL industries")
+        # Directly assign data from 2022 as test data and other years as train data
+        test_data = df[df['year'] == 2022.0]
+        train_data = df[df['year'] != 2022.0]
+
+        test_labels = test_data[TARGET_VAR]
+        test_features = test_data.drop([TARGET_VAR, INDUSTRY_VAR], axis=1)
+
+        matched_train_data = DataMatcher(target_var=TARGET_VAR, id_fields=ID_FIELDS, cluster_on=CLUSTER_ON, neighbors=n).fit_transform(train_data)
+
+        if matched_train_data.empty:
+            logging.warning(f"No matched data for ALL industries with {n} neighbors")
+            continue
+
+        train_labels = matched_train_data[TARGET_VAR]
+        train_features = matched_train_data.drop([TARGET_VAR, INDUSTRY_VAR], axis=1)
+
+        data_name = Path(data_file).stem
+        title_all = f"XGBoost Model on {data_name} (Neighbors={n})"
+        output_path_all = output_dir / f"{data_name}_NeighborsFacset_report.txt"
+
+        try:
+            train_evaluate_model(train_features, test_features, train_labels, test_labels, pipeline, title, output_path, result_path, "ALL", n)
+        except Exception as e:
+            logging.error(f"Error running model on ALL industries with {n} neighbors: {e}")
+
+
+if __name__ == "__main__":
+    main()
