@@ -1,0 +1,304 @@
+import logging
+from pathlib import Path
+from datetime import datetime
+import pickle
+import sys
+import subprocess
+import pkg_resources
+import time
+import joblib
+
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+from sklearn.neighbors import NearestNeighbors
+from sklearn.pipeline import Pipeline
+import pandas as pd
+import xgboost as xgb
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.neighbors import NearestNeighbors
+from sklearn.pipeline import Pipeline
+
+# Function to install a package if it's not already installed
+def install_package(package):
+    try:
+        pkg_resources.get_distribution(package)
+    except pkg_resources.DistributionNotFound:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+install_package("openpyxl")
+
+import numpy as np
+import xgboost as xgb
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.neighbors import NearestNeighbors
+from sklearn.pipeline import Pipeline
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Paths and file names
+data_dir = Path(r"C:\Users\16036\OneDrive\Desktop\Investor Sight\Vulnerability\Model")
+stata_dir = data_dir
+output_dir = data_dir
+data_file = "Merged_dataset-2024-04-04.dta"
+
+# Constants
+TARGET_VAR = "F1_Factset_activism"
+INDUSTRY_VAR = "sic_1_digit"
+CLUSTER_ON = ["ln_mkv"]
+CUTOFF_YEAR = 2014
+MODEL_LABEL = "xgb"
+NEIGHBORS_MAPPING = {
+    9: 36,
+    8: 66,
+    2: 199,
+    4: 12,
+    6: 134,
+    7: 95,
+    3: 149,
+    1: 88,
+    5: 1,
+    0: 84
+}
+
+DATA_FIELDS = [
+    "ticker",  
+    TARGET_VAR,
+    INDUSTRY_VAR,
+    "year",
+    "gvkey",
+    "ln_mkv",
+    "activist_share_pct",
+    "avg_networksize",
+    "avg_support_director",
+    "avg_support_management",
+    "board_independent_ratio",
+    "cash_holding",
+    "ceo_appoint",
+    "ceo_turnover",
+    "ctype1",
+    "ctype2",
+    "ctype4",
+    "ctype21",
+    "current_ratio",
+    "debt_ratio",
+    "ded_pct",
+    "instown_hhi",
+    "intan_ratio",
+    "ln_at",
+    "ln_capx",
+    "ln_rd",
+    "ln_xad",
+    "num_rec",
+    "prstkc",
+    "risk_taking_value",
+    "roa",
+    "roa_2",
+    "roa_3",
+    "roe",
+    "roe_2",
+    "roe_3",
+    "short_ratio",
+    "stock_ret",
+    "tobin_q",
+    "tra_pct",
+    "w_environment",
+    "w_governance",
+    "w_social",
+    "xsga_ratio",
+    "yearfounded",
+    "t_num_employees"
+]
+
+
+DATA_FIELDS = list(dict.fromkeys(DATA_FIELDS))
+ID_FIELDS = DATA_FIELDS[:5]
+
+# Hyperparameters for XGBoost
+param_grid = {
+    'colsample_bytree': 0.9,
+    'gamma': 0.2,
+    'learning_rate': 0.2,
+    'max_depth': 3,
+    'min_child_weight': 1,
+    'n_estimators': 100,
+    'reg_alpha': 0.1,
+    'reg_lambda': 0,
+    'subsample': 0.8
+}
+
+class DataProcessor:
+    def __init__(self, data_file, data_fields, id_fields, cutoff_year=CUTOFF_YEAR):
+        self.data_file = data_file
+        self.data_fields = data_fields
+        self.id_fields = id_fields
+        self.cutoff_year = cutoff_year
+        logging.info(f"DataProcessor initialized with {self.data_file}")
+
+    def prepare_data(self, data):
+        # Log the initial data state
+        start_rows = len(data)
+        logging.info("Removing rows with missing 'ln_mkv'")
+
+        # Drop rows where 'ln_mkv' is NaN
+        data = data.dropna(subset=['ln_mkv'])
+        
+        # Log how many rows were dropped
+        end_rows = len(data)
+        logging.info(f"Dropped {start_rows - end_rows} rows due to missing 'ln_mkv'")
+
+        return data
+
+    def load_data(self):
+        logging.info(f"Reading {self.data_file} into a DataFrame")
+        df = pd.read_stata(self.data_file)
+        logging.info(f"Data loaded with {df.shape[0]} rows and {df.shape[1]} columns")
+        df.to_csv(output_dir / "raw_data.csv", index=False)
+        df = df[self.data_fields]
+        logging.info(f"Data filtered for {len(self.data_fields)} fields")
+
+        logging.info(f"Data filtered for year >= {self.cutoff_year}")
+        df = df[df["year"] >= self.cutoff_year]
+
+        logging.info("Preparation and filtering complete, proceeding without removing missing values.")
+        df = self.prepare_data(df)
+        return df
+
+
+class DataMatcher(BaseEstimator, TransformerMixin):
+    def __init__(self, target_var, id_fields, group_fields=[INDUSTRY_VAR, 'year'], cluster_on=['ln_mkv'], neighbors=1):
+        self.target_var = target_var
+        self.id_fields = id_fields
+        self.group_fields = group_fields
+        self.cluster_on = cluster_on
+        self.nearest_neighbors = neighbors
+
+    def create_groups(self, df):
+        groups = df.groupby(self.group_fields, group_keys=False, observed=False)
+        return groups
+
+    def match_simple(self, group):
+        logging.info(f"Matching in group with size: {len(group)}")
+        minority = group[group[self.target_var] == 1]
+        majority = group[group[self.target_var] == 0]
+
+        if minority.empty or majority.empty:
+            logging.info("Insufficient data for matching in this group.")
+            return pd.DataFrame()
+
+        nn = NearestNeighbors(n_neighbors=min(len(majority), self.nearest_neighbors))
+        nn.fit(majority[self.cluster_on])
+        distances, indices = nn.kneighbors(minority[self.cluster_on])
+        matched_majority_indices = indices.flatten()
+
+        matched_majority = majority.iloc[matched_majority_indices]
+        matched_samples = pd.concat([minority, matched_majority]).drop_duplicates()
+
+        logging.info(f"Matched samples size: {len(matched_samples)}")
+        return matched_samples
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        groups = self.create_groups(X)
+        matched_samples = pd.DataFrame()
+        for name, group in groups:
+            matched_group = self.match_simple(group)
+            matched_samples = pd.concat([matched_samples, matched_group], ignore_index=True)
+        logging.info(f"Total matched data size after processing all groups: {len(matched_samples)}")
+        return matched_samples
+
+def train_and_save_model(train_features, train_labels, pipeline, industry, neighbors):
+
+    # Train the model
+    pipeline.fit(train_features, train_labels)
+
+    # Save the model
+    model_filename = output_dir / f"model_sic_{int(industry)}_neighbors_{neighbors}.pkl"
+    joblib.dump(pipeline, model_filename)
+    logging.info(f"Model saved for {industry} industry with {neighbors} neighbors")
+
+    # Save the feature names
+    feature_names_filename = output_dir / f"feature_names_sic_{int(industry)}_neighbors_{neighbors}.pkl"
+    with open(feature_names_filename, 'wb') as f:
+        pickle.dump(train_features.columns.tolist(), f)
+    logging.info(f"Feature names saved for {industry} industry with {neighbors} neighbors")
+
+
+
+def predict_confidence_scores(test_data, sic_mapping):
+    results = []
+
+    for idx, row in test_data.iterrows():
+        industry = row[INDUSTRY_VAR]
+        neighbors = NEIGHBORS_MAPPING.get(industry, 1)
+        model_filename = output_dir / f"model_sic_{int(industry)}_neighbors_{neighbors}.pkl"
+
+        if not model_filename.exists():
+            logging.warning(f"No model found for {industry} industry with {neighbors} neighbors")
+            continue
+
+        # Load the model
+        model = joblib.load(model_filename)
+
+        # Prepare the data for prediction
+        row_features = row.drop([TARGET_VAR, INDUSTRY_VAR]).values.reshape(1, -1)
+
+        # Predict the confidence score
+        confidence_score = model.predict_proba(row_features)[0, 1]  # Assuming binary classification
+        results.append((row['gvkey'], industry, confidence_score))
+
+    return results
+
+def main():
+    stata_file_path = stata_dir / data_file
+    logging.info(f"Loading data from {stata_file_path}")
+
+    df = DataProcessor(stata_file_path, DATA_FIELDS, ID_FIELDS, cutoff_year=CUTOFF_YEAR).load_data()
+
+    # Separate the data from 2022 as the testing set and save it as CSV
+    test_data = df[df['year'] == 2022.0]
+    train_data = df[df['year'] != 2022.0]
+    test_data.to_csv(output_dir / "test_data_2022.csv", index=False)
+
+    # SIC 1 Digit mapping
+    sic_mapping = {
+        0: "Agriculture",
+        1: "Mining",
+        2: "Construction",
+        3: "Manufacturing",
+        4: "Transportation, Communications, Electric, Gas, and Sanitary Services",
+        5: "Wholesale Trade",
+        6: "Retail Trade",
+        7: "Finance, Insurance, and Real Estate",
+        8: "Services",
+        9: "Public Administration",
+        "ALL": "ALL"
+    }
+
+    # Process each industry within the training data
+    industries = train_data[INDUSTRY_VAR].unique()
+    for industry in sorted(industries):
+        logging.info(f"Running model on {sic_mapping[industry]} industry")
+        df_industry = train_data[train_data[INDUSTRY_VAR] == industry]
+
+        neighbors = NEIGHBORS_MAPPING.get(industry, 1)  # Default to 1 neighbor if not specified
+        matched_train_data = DataMatcher(target_var=TARGET_VAR, id_fields=ID_FIELDS, cluster_on=CLUSTER_ON, neighbors=neighbors).fit_transform(df_industry)
+
+        if matched_train_data.empty:
+            logging.warning(f"No matched data for {sic_mapping[industry]} industry with {neighbors} neighbors")
+            continue
+
+        train_labels = matched_train_data[TARGET_VAR]
+        train_features = matched_train_data.drop([TARGET_VAR, INDUSTRY_VAR], axis=1)
+        train_features = train_features.drop(columns=["ticker"])
+
+        pipeline = Pipeline([(MODEL_LABEL, xgb.XGBClassifier(**param_grid))])
+        train_and_save_model(train_features, train_labels, pipeline, industry, neighbors)
+
+
+if __name__ == "__main__":
+    main()
+
