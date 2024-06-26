@@ -1,0 +1,219 @@
+import logging
+from pathlib import Path
+import pickle
+import sys
+import subprocess
+import pkg_resources
+import joblib
+
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+import pandas as pd
+import xgboost as xgb
+import numpy as np
+
+# Function to install a package if it's not already installed
+def install_package(package):
+    try:
+        pkg_resources.get_distribution(package)
+    except pkg_resources.DistributionNotFound:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+install_package("openpyxl")
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Paths and file names
+data_dir = Path(r"C:\Users\16036\OneDrive\Desktop\Investor Sight\Vulnerability\Model")
+output_dir = data_dir
+
+# Constants
+TARGET_VAR = "F1_Factset_activism"
+INDUSTRY_VAR = "sic_1_digit"
+CUTOFF_YEAR = 2015
+NEIGHBORS_MAPPING = {
+    9: 36,
+    8: 66,
+    2: 199,
+    4: 12,
+    6: 134,
+    7: 95,
+    3: 149,
+    1: 88,
+    5: 1,
+    0: 84
+}
+
+DATA_FIELDS = [
+    "ticker",  # Add ticker here
+    TARGET_VAR,
+    INDUSTRY_VAR,
+    "year",
+    "gvkey",
+    "ln_mkv",
+    "activist_share_pct",
+    "avg_networksize",
+    "avg_support_director",
+    "avg_support_management",
+    "board_independent_ratio",
+    "cash_holding",
+    "ceo_appoint",
+    "ceo_turnover",
+    "ctype1",
+    "ctype2",
+    "ctype4",
+    "ctype21",
+    "current_ratio",
+    "debt_ratio",
+    "ded_pct",
+    "instown_hhi",
+    "intan_ratio",
+    "ln_at",
+    "ln_capx",
+    "ln_rd",
+    "ln_xad",
+    "num_rec",
+    "prstkc",
+    "risk_taking_value",
+    "roa",
+    "roa_2",
+    "roa_3",
+    "roe",
+    "roe_2",
+    "roe_3",
+    "short_ratio",
+    "stock_ret",
+    "tobin_q",
+    "tra_pct",
+    "w_environment",
+    "w_governance",
+    "w_social",
+    "xsga_ratio",
+    "yearfounded",
+    "t_num_employees"
+]
+
+# SIC 1 Digit mapping
+sic_mapping = {
+    0: "Agriculture",
+    1: "Mining",
+    2: "Construction",
+    3: "Manufacturing",
+    4: "Transportation, Communications, Electric, Gas, and Sanitary Services",
+    5: "Wholesale Trade",
+    6: "Retail Trade",
+    7: "Finance, Insurance, and Real Estate",
+    8: "Services",
+    9: "Public Administration",
+    "ALL": "ALL"
+}
+
+# Function to calculate market cap category from ln_mkv
+def market_cap_category(ln_mkv):
+    mkv = np.exp(ln_mkv)
+    if mkv >= 10**10:
+        return "Large Cap (>$10B)"
+    elif 2 * 10**9 <= mkv < 10**10:
+        return "Mid Cap ($2B-$10B)"
+    elif 250 * 10**6 <= mkv < 2 * 10**9:
+        return "Small Cap ($250M-$2B)"
+    elif 50 * 10**6 <= mkv < 250 * 10**6:
+        return "Micro Cap ($50M-$250M)"
+    else:
+        return "Unknown"
+
+# Function to calculate feature influence
+def feature_influence(feature_value, feature_name):
+    # Example logic for determining influence
+    if feature_value > 0.5:  # This is just an example condition
+        return "+"
+    else:
+        return "-"
+
+
+def main():
+    # Optional: Load test data from CSV
+    test_data = pd.read_csv(output_dir / "test_data_2022.csv")
+
+    # Take a few rows from the test set for prediction
+    #test_sample = test_data.sample(n=10, random_state=42)
+
+    test_sample = test_data
+    test_sample.to_excel(output_dir / "test_sample.xlsx", index=False)
+
+    # Predict confidence scores
+    confidence_scores = []
+    true_labels = []
+    predicted_labels = []
+    predicted_probabilities = []
+
+    for _, row in test_sample.iterrows():
+        industry = row[INDUSTRY_VAR]
+        model_filename = output_dir / f"model_sic_{int(industry)}_neighbors_{NEIGHBORS_MAPPING[industry]}.pkl"
+        feature_names_filename = output_dir / f"feature_names_sic_{int(industry)}_neighbors_{NEIGHBORS_MAPPING[industry]}.pkl"
+
+        if not model_filename.exists() or not feature_names_filename.exists():
+            logging.warning(f"No model or feature names found for {sic_mapping[industry]} industry with {NEIGHBORS_MAPPING[industry]} neighbors")
+            continue
+
+        with open(model_filename, 'rb') as model_file:
+            model = pickle.load(model_file)
+        with open(feature_names_filename, 'rb') as f:
+            feature_names = pickle.load(f)
+
+        features = row.drop([TARGET_VAR])
+        features = features.reindex(feature_names, axis=1)
+        confidence_score = model.predict_proba(features.values.reshape(1, -1))[0][1]  # Probability of class 1
+        predicted_label = model.predict(features.values.reshape(1, -1))[0]  # Predicted label
+
+        # Create dictionary for current row
+        row_dict = {
+            "SIC 1 digit": sic_mapping[industry],
+            "Gvkey": row['gvkey'],
+            "Confidence Score": confidence_score,
+            "Sector": sic_mapping[industry],
+            "Market Cap Category": market_cap_category(row['ln_mkv']),
+            "Vulnerability": "High" if confidence_score >= 0.5 else "Mid" if confidence_score >= 0.2 else "Low"
+        }
+
+        # Add feature influences
+        for feature in feature_names:
+            row_dict[f"{feature}"] = feature_influence(row[feature], feature)
+
+        confidence_scores.append(row_dict)
+
+        true_labels.append(row[TARGET_VAR])
+        predicted_labels.append(predicted_label)
+        predicted_probabilities.append(confidence_score)
+
+    # Function to calculate confusion matrix for a given threshold
+    def calculate_confusion_matrix_and_metrics(threshold):
+        if not predicted_probabilities:  # If the list is empty, return an empty confusion matrix
+            return np.array([]), {}
+        thresholded_predictions = [1 if prob >= threshold else 0 for prob in predicted_probabilities]
+        conf_matrix = confusion_matrix(true_labels, thresholded_predictions)
+        metrics = {
+            'accuracy': accuracy_score(true_labels, thresholded_predictions),
+            'precision': precision_score(true_labels, thresholded_predictions, average=None),
+            'recall': recall_score(true_labels, thresholded_predictions, average=None),
+            'f1_score': f1_score(true_labels, thresholded_predictions, average=None)
+        }
+        return conf_matrix, metrics
+
+    # Save confidence scores and confusion matrices to Excel
+    confidence_scores_df = pd.DataFrame(confidence_scores)
+    thresholds = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
+    with pd.ExcelWriter(output_dir / "confidence_scoresnew.xlsx") as writer:
+        confidence_scores_df.to_excel(writer, sheet_name="Confidence Scores", index=False)
+        for threshold in thresholds:
+            conf_matrix, metrics = calculate_confusion_matrix_and_metrics(threshold)
+            if conf_matrix.size != 0:  # If confusion matrix is not empty
+                conf_matrix_df = pd.DataFrame(conf_matrix, index=["Actual 0", "Actual 1"], columns=["Predicted 0", "Predicted 1"])
+                conf_matrix_df.to_excel(writer, sheet_name=f"Confusion Matrix {int(threshold*100)}%", startrow=0, startcol=0)
+                
+                metrics_df = pd.DataFrame(metrics, index=["Class 0", "Class 1"])
+                metrics_df.to_excel(writer, sheet_name=f"Confusion Matrix {int(threshold*100)}%", startrow=conf_matrix_df.shape[0] + 3, startcol=0)
+
+
+if __name__ == "__main__":
+    main()
