@@ -1,0 +1,326 @@
+import logging
+from pathlib import Path
+from datetime import datetime
+import pickle
+import sys
+import subprocess
+import pkg_resources
+import time
+import joblib
+from openpyxl.formatting.rule import ColorScaleRule
+
+
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+from sklearn.neighbors import NearestNeighbors
+from sklearn.pipeline import Pipeline
+import pandas as pd
+import xgboost as xgb
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.neighbors import NearestNeighbors
+from sklearn.pipeline import Pipeline
+
+import openpyxl
+from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl.styles import Font, Alignment
+from openpyxl.cell.cell import MergedCell
+from openpyxl.utils import get_column_letter
+from openpyxl.styles import Border, Side
+
+
+# Function to install a package if it's not already installed
+def install_package(package):
+    try:
+        pkg_resources.get_distribution(package)
+    except pkg_resources.DistributionNotFound:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+install_package("openpyxl")
+
+import numpy as np
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Paths and file names
+data_dir = Path(r"C:\Users\16036\OneDrive\Desktop\Investor Sight\Vulnerability\Model")
+output_dir = data_dir
+
+# Constants
+TARGET_VAR = "F1_Factset_activism"
+INDUSTRY_VAR = "sic_1_digit"
+CUTOFF_YEAR = 2015
+NEIGHBORS_MAPPING = {
+    9: 36,
+    8: 66,
+    2: 199,
+    4: 12,
+    6: 134,
+    7: 95,
+    3: 149,
+    1: 88,
+    5: 1,
+    0: 84
+}
+
+DATA_FIELDS = [
+    "ticker",  # Add ticker to DATA_FIELDS
+    TARGET_VAR,
+    INDUSTRY_VAR,
+    "year",
+    "gvkey",
+    "ln_mkv",
+    "activist_share_pct",
+    "avg_networksize",
+    "avg_support_director",
+    "avg_support_management",
+    "board_independent_ratio",
+    "cash_holding",
+    "ceo_appoint",
+    "ceo_turnover",
+    "ctype1",
+    "ctype2",
+    "ctype4",
+    "ctype21",
+    "current_ratio",
+    "debt_ratio",
+    "ded_pct",
+    "instown_hhi",
+    "intan_ratio",
+    "ln_at",
+    "ln_capx",
+    "ln_rd",
+    "ln_xad",
+    "num_rec",
+    "prstkc",
+    "risk_taking_value",
+    "roa",
+    "roa_2",
+    "roa_3",
+    "roe",
+    "roe_2",
+    "roe_3",
+    "short_ratio",
+    "stock_ret",
+    "tobin_q",
+    "tra_pct",
+    "w_environment",
+    "w_governance",
+    "w_social",
+    "xsga_ratio",
+    "yearfounded",
+    "t_num_employees"
+]
+
+# SIC 1 Digit mapping
+sic_mapping = {
+    0: "Agriculture",
+    1: "Mining",
+    2: "Construction",
+    3: "Manufacturing",
+    4: "Transportation, Communications, Electric, Gas, and Sanitary Services",
+    5: "Wholesale Trade",
+    6: "Retail Trade",
+    7: "Finance, Insurance, and Real Estate",
+    8: "Services",
+    9: "Public Administration",
+    "ALL": "ALL"
+}
+
+# Function to calculate market cap category from ln_mkv
+def market_cap_category(ln_mkv):
+    mkv = np.exp(ln_mkv)
+    if mkv >= 10**10:
+        return "Large Cap (>$10B)"
+    elif 2 * 10**9 <= mkv < 10**10:
+        return "Mid Cap ($2B-$10B)"
+    elif 250 * 10**6 <= mkv < 2 * 10**9:
+        return "Small Cap ($250M-$2B)"
+    elif 50 * 10**6 <= mkv < 250 * 10**6:
+        return "Micro Cap ($50M-$250M)"
+    else:
+        return "Unknown"
+    
+def calculate_vulnerability(confidence_score):
+    if confidence_score >= 0.5:
+        return "High"
+    elif confidence_score >= 0.2:
+        return "Mid"
+    else:
+        return "Low"
+
+# Function to calculate feature influence
+def get_feature_influences(model, feature_names):
+    importances = model.named_steps["xgb"].feature_importances_
+    return dict(zip(feature_names, importances))
+
+def main():
+    # Optional: Load test data from CSV
+    test_data = pd.read_csv(output_dir / "test_data_2022.csv")
+
+    # Take a few rows from the test set for prediction
+    test_sample = test_data
+    test_sample.to_excel(output_dir / "test_sample.xlsx", index=False)
+
+    # Predict confidence scores
+    confidence_scores = []
+    true_labels = []
+    predicted_labels = []
+    predicted_probabilities = []
+
+    for _, row in test_sample.iterrows():
+        industry = row[INDUSTRY_VAR]
+        model_filename = output_dir / f"model_sic_{int(industry)}_neighbors_{NEIGHBORS_MAPPING[industry]}.pkl"
+        feature_names_filename = output_dir / f"feature_names_sic_{int(industry)}_neighbors_{NEIGHBORS_MAPPING[industry]}.pkl"
+        if not model_filename.exists():
+            logging.warning(f"No model found for {sic_mapping[industry]} industry with {NEIGHBORS_MAPPING[industry]} neighbors")
+            continue
+
+        with open(model_filename, 'rb') as model_file:
+            model = pickle.load(model_file)
+        
+        with open(feature_names_filename, 'rb') as feature_file:
+            feature_names = pickle.load(feature_file)
+        
+        # Align the features with the saved feature names
+        features = row[feature_names].values.reshape(1, -1)
+        confidence_score = model.predict_proba(features)[0][1]  # Probability of class 1
+        predicted_label = model.predict(features)[0]  # Predicted label
+        feature_influences = get_feature_influences(model, feature_names)
+        
+        confidence_score_row = {
+            "Ticker": row["ticker"],
+            "Company": "",  # Placeholder
+            "Gvkey": row["gvkey"],
+            "Sector": sic_mapping[industry],
+            "Market Cap Category": market_cap_category(row["ln_mkv"]),
+            "Exchange": "",  # Placeholder
+            "Company HQ": "",  # Placeholder
+            "Company Region": "",  # Placeholder
+            "Vulnerability": calculate_vulnerability(confidence_score),
+            "Confidence Score": confidence_score,  # Multiply by 100 for percentage
+            "# times targeted (prior 5 years)": 0  # Placeholder
+        }
+        
+        # Add feature influences
+        for feature in feature_names:
+            influence = feature_influences.get(feature, 0)
+            confidence_score_row[feature] = "+" if influence > 0 else "-"
+        
+        confidence_scores.append(confidence_score_row)
+        true_labels.append(row[TARGET_VAR])
+        predicted_labels.append(predicted_label)
+        predicted_probabilities.append(confidence_score)
+
+    # Create DataFrame
+    confidence_scores_df = pd.DataFrame(confidence_scores)
+
+    # Save to Excel with formatting
+    output_file = output_dir / "model_output.xlsx"
+    with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+        confidence_scores_df.to_excel(writer, sheet_name="output", index=False)
+
+        # Load the workbook and select the active worksheet
+        workbook = writer.book
+        worksheet = workbook.active
+
+        # Add a blank row before the results start
+        worksheet.insert_rows(3)
+
+        # Set the font to Aptos Light, size 11
+        default_font = Font(name='Aptos Light', size=11)
+        for row in worksheet.iter_rows():
+            for cell in row:
+                cell.font = default_font
+
+        worksheet.sheet_view.showGridLines = False
+        
+        # Merge and format header cells
+        header_font = Font(bold=True, name='Aptos Light', size=11)
+        subheader_font = Font(name='Aptos Light', size=11)
+        alignment = Alignment(horizontal="center", vertical="center")
+
+        # Borders
+        thin_border = Border(
+            left=Side(style='thin'),
+            right=Side(style='thin'),
+            top=Side(style='thin'),
+            bottom=Side(style='thin')
+        )
+
+        for row in worksheet.iter_rows(min_row=4, max_row=worksheet.max_row, min_col=10, max_col=10):
+            for cell in row:
+                cell.value = round(float(cell.value) * 100, 2)
+
+
+        # Merge cells and set headers
+        headers = ["Company Information", "Activism Indicators", "Company Fundamentals", "Market Characteristics"]
+        subheaders = [
+            ["Ticker", "Company", "Gvkey", "Sector", "Market Cap Category", "Exchange", "Company HQ", "Company Region"],
+            ["Vulnerability", "Confidence Score", "# times targeted (prior 5 years)"],
+            ["year", "gvkey", "ln_mkv", "activist_share_pct", "avg_networksize", "avg_support_director", "avg_support_management", "board_independent_ratio", "cash_holding", "ceo_appoint", "ceo_turnover"],
+            ["ctype1", "ctype2", "ctype4", "ctype21", "current_ratio", "debt_ratio", "ded_pct", "instown_hhi", "intan_ratio", "ln_at", "ln_capx", "ln_rd", "ln_xad", "num_rec", "prstkc", "risk_taking_value", "roa", "roa_2", "roa_3", "roe", "roe_2", "roe_3", "short_ratio", "stock_ret", "tobin_q", "tra_pct", "w_environment", "w_governance", "w_social", "xsga_ratio", "yearfounded", "t_num_employees"]
+        ]
+
+        col_start = 1
+        for header, subheader in zip(headers, subheaders):
+            col_end = col_start + len(subheader) - 1
+            worksheet.merge_cells(start_row=1, start_column=col_start, end_row=1, end_column=col_end)
+            cell = worksheet.cell(row=1, column=col_start)
+            cell.value = header
+            cell.font = header_font
+            cell.alignment = alignment
+            cell.border = Border(bottom=Side(style='thin'))
+            for col in range(col_start, col_end + 1):
+                sub_cell = worksheet.cell(row=2, column=col)
+                sub_cell.value = subheader[col - col_start]
+                sub_cell.font = subheader_font
+                sub_cell.alignment = alignment
+                sub_cell.border = thin_border
+            col_start = col_end + 1
+
+        # Make the "Ticker" column bold
+        for row in worksheet.iter_rows(min_row=4, max_row=worksheet.max_row, min_col=1, max_col=1):
+            for cell in row:
+                cell.font = Font(bold=True, name='Aptos Light', size=11)
+
+        # Center align specific columns
+        for col in ["J", "K", "L"]:
+            for cell in worksheet[col]:
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        # Autofill the width of each column
+        for col in worksheet.columns:
+            max_length = 0
+            column = col[0].column  # Get the column number
+            column_letter = get_column_letter(column)  # Convert to column letter
+            for cell in col:
+                try:
+                    if not isinstance(cell, MergedCell) and len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            adjusted_width = (max_length + 2)
+            worksheet.column_dimensions[column_letter].width = adjusted_width
+
+        # Increase the height of row 2
+        worksheet.row_dimensions[2].height = 30
+
+        # Add bottom border to the last row
+        last_row = worksheet.max_row
+        for cell in worksheet[last_row]:
+            cell.border = Border(bottom=Side(style='thin'))
+
+        color_scale_rule = ColorScaleRule(start_type='min', start_color='63BE7B',
+                                          mid_type='percentile', mid_value=50, mid_color='FFEB84',
+                                          end_type='max', end_color='F8696B')
+
+        worksheet.conditional_formatting.add('J5:J{}'.format(last_row), color_scale_rule)
+
+
+
+    print(f"Formatted confidence scores saved to {output_file}")
+
+if __name__ == "__main__":
+    main()
