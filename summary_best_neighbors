@@ -1,0 +1,80 @@
+import pandas as pd
+
+from pathlib import Path
+
+def main():
+
+    # Paths
+    data_dir = Path(r"C:\Users\16036\OneDrive\Desktop\Investor Sight\Vulnerability")
+    model_results_path = data_dir / "model_resultsFacset2022.xlsx"
+    summary_results_path = data_dir / "summary_resultsFacset2022.xlsx"
+
+    # SIC 1 Digit mapping
+    sic_mapping = {
+        0: "Agriculture",
+        1: "Mining",
+        2: "Construction",
+        3: "Manufacturing",
+        4: "Transportation, Communications, Electric, Gas, and Sanitary Services",
+        5: "Wholesale Trade",
+        6: "Retail Trade",
+        7: "Finance, Insurance, and Real Estate",
+        8: "Services",
+        9: "Public Administration",
+        "ALL": "ALL"
+    }
+
+    # Read the model results
+    df = pd.read_excel(model_results_path, engine='openpyxl')
+
+    # Map SIC 1 Digit codes to descriptions
+    df['SIC 1 digit'] = df['industry'].map(sic_mapping)
+
+    # Group by industry and select the row with the highest f1 1 score for each industry
+    best_rows = df.loc[df.groupby('industry')['f1 1'].idxmax()]
+
+    # Calculate weighted average f1 1
+    total_minority = best_rows['train count ones'].sum()
+    best_rows['weighted_f1_1'] = best_rows['f1 1'] * best_rows['train count ones'] / total_minority
+    weighted_avg_f1_1 = best_rows['weighted_f1_1'].sum()
+
+    # Calculate average f1 1
+    avg_f1_1 = best_rows['f1 1'].mean()
+
+    # Create summary DataFrame
+    summary_df = best_rows.drop(columns=['weighted_f1_1']).copy()
+
+    # Format the summary DataFrame to look like the desired output
+    summary_df = summary_df[['SIC 1 digit', 'f1 1', 'precision 1', 'recall 1', 'accuracy', 'train total points', 'train count ones', 'neighbors']]
+    summary_df.columns = ['SIC 1 digit', 'Best f1 1', 'Precision 1', 'Recall 1', 'Accuracy', 'Total Train', 'Minority', 'Best Neighbors']
+
+    # Display f1 1 in % with 4 significant digits
+    summary_df['Best f1 1'] = summary_df['Best f1 1'].apply(lambda x: f"{x:.4%}")
+
+    # Rank the summary DataFrame by high to low f1 1
+    summary_df = summary_df.sort_values(by='Best f1 1', ascending=False)
+
+    # Create a DataFrame for the weighted average and average f1 1
+    summary_stats = pd.DataFrame({
+        'SIC 1 digit': [''] * 3 + ['Weighted Avg f1 1', 'Avg f1 1'],
+        'Best f1 1': [''] * 3 + [f"{weighted_avg_f1_1:.4%}", f"{avg_f1_1:.4%}"],
+        'Precision 1': [''] * 5,
+        'Recall 1': [''] * 5,
+        'Accuracy': [''] * 5,
+        'Total Train': [''] * 5,
+        'Minority': [''] * 5,
+        'Best Neighbors': [''] * 5
+    })
+
+    # Add explanation in the cell on the left
+    summary_stats.loc[3, 'SIC 1 digit'] = 'Weighted average based on minority'
+    summary_stats.loc[4, 'SIC 1 digit'] = 'Simple average of f1 1'
+
+    # Concatenate the summary DataFrame and the summary stats DataFrame
+    final_summary_df = pd.concat([summary_df, summary_stats], ignore_index=True)
+
+    # Write summary to a new Excel file
+    final_summary_df.to_excel(summary_results_path, index=False, engine='openpyxl')
+
+if __name__ == "__main__":
+    main()
