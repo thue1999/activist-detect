@@ -1,0 +1,225 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+import logging
+from pathlib import Path
+from datetime import datetime
+import pickle
+import sys
+import subprocess
+import pkg_resources
+import time
+import seaborn as sns
+
+# Function to install a package if it's not already installed
+def install_package(package):
+    try:
+        pkg_resources.get_distribution(package)
+    except pkg_resources.DistributionNotFound:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+install_package('reportlab')
+install_package('PyPDF2')
+
+
+from reportlab.lib.pagesizes import landscape, letter
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import landscape, letter
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.pdfgen import canvas
+from reportlab.platypus import PageBreak
+from PyPDF2 import PdfMerger, PdfReader
+
+
+# Paths and file names
+data_dir = Path(r"C:\Users\16036\OneDrive\Desktop\Investor Sight\Vulnerability\Model")
+output_pdf_path = data_dir / "histogram_report.pdf"
+input_file = data_dir / "test_data_2022.xlsx"
+
+# SIC 1 Digit mapping
+sic_mapping = {
+    0: "Agriculture",
+    1: "Mining",
+    2: "Construction",
+    3: "Manufacturing",
+    4: "Transportation, Communications, Electric, Gas, and Sanitary Services",
+    5: "Wholesale Trade",
+    6: "Retail Trade",
+    7: "Finance, Insurance, and Real Estate",
+    8: "Services",
+    9: "Public Administration",
+    "ALL": "ALL"
+}
+
+# Read the data
+df = pd.read_excel(input_file)
+
+# Function to create histogram and save it as an image
+def create_histogram(df, title, filename):
+    bins = [i/10 for i in range(11)]
+    df = df.copy()  # Ensure we're working on a copy to avoid SettingWithCopyWarning
+    df['binned'] = pd.cut(df['Confidence Score'], bins, include_lowest=True)
+    percentage_df = df.groupby('binned')['F1_Factset_activism'].value_counts(normalize=True).unstack().fillna(0) * 100
+
+    fig, ax = plt.subplots()
+    percentage_df.plot(kind='bar', stacked=True, color=['red', 'blue'], ax=ax)
+    ax.set_ylabel('Percentage')
+    ax.set_xlabel('Confidence Score Bins')
+    ax.set_title(title)
+
+    for container in ax.containers:
+        labels = [f'{v:.1f}%' if v > 0 else '' for v in container.datavalues]
+        ax.bar_label(container, labels=labels, label_type='center')
+
+    ax.set_xticklabels([f'{bins[i]} - {bins[i+1]}' for i in range(len(bins)-1)], rotation=45, ha='right')
+    plt.legend(title='F1_Factset_activism', loc='upper left', bbox_to_anchor=(1, 1))
+
+    plt.savefig(filename, bbox_inches='tight')
+    plt.close()
+
+# Create histogram for the entire dataset
+create_histogram(df, 'Histogram for All Industries', str(data_dir / 'all_industries_histogram.png'))
+
+# Create histograms for each industry
+industries = df['sic_1_digit'].unique()
+for industry in industries:
+    industry_df = df[df['sic_1_digit'] == industry]
+    industry_name = sic_mapping.get(int(industry), f'Industry {int(industry)}')
+    create_histogram(industry_df, f'Histogram for {industry_name}', str(data_dir / f'{industry_name}_histogram.png'))
+
+def create_bin_data_table(df):
+    bins = [i/10 for i in range(11)]
+    df['binned'] = pd.cut(df['Confidence Score'], bins, include_lowest=True)
+    bin_data = df.groupby('binned', observed=False)['F1_Factset_activism'].value_counts().unstack().fillna(0)
+    bin_data['Total'] = bin_data.sum(axis=1)
+    bin_data.reset_index(inplace=True)
+    bin_data.columns = ['Confidence Score Bin', 'Actual 0', 'Actual 1', 'Total']
+    
+    # Calculate average confidence scores
+    avg_conf_all = df['Confidence Score'].mean()
+    avg_conf_1 = df[df['F1_Factset_activism'] == 1]['Confidence Score'].mean()
+    avg_conf_0 = df[df['F1_Factset_activism'] == 0]['Confidence Score'].mean()
+    
+    return bin_data, avg_conf_all, avg_conf_1, avg_conf_0
+
+# Function to add tables to the PDF
+def add_tables_to_pdf(pdf_path, df):
+    doc = SimpleDocTemplate(pdf_path, pagesize=landscape(letter))
+    elements = []
+    styles = getSampleStyleSheet()
+
+    # Create and add the table for the entire dataset
+    bin_data, avg_conf_all, avg_conf_1, avg_conf_0 = create_bin_data_table(df)
+    data = [bin_data.columns.tolist()] + bin_data.values.tolist()
+    table = Table(data)
+    table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+        ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+        ('GRID', (0, 0), (-1, -1), 1, colors.black),
+    ]))
+    elements.append(Paragraph('Data Table for All Industries', styles['Title']))
+    elements.append(table)
+    elements.append(Spacer(1, 12))  # Add space between tables
+    elements.append(Paragraph(f'Average Confidence Score: {avg_conf_all:.2f}', styles['Normal']))
+    elements.append(Paragraph(f'Average Confidence Score (Actual 1): {avg_conf_1:.2f}', styles['Normal']))
+    elements.append(Paragraph(f'Average Confidence Score (Actual 0): {avg_conf_0:.2f}', styles['Normal']))
+
+    # Create and add tables for each industry
+    industries = df['sic_1_digit'].unique()
+    for industry in industries:
+        industry_df = df[df['sic_1_digit'] == industry]
+        bin_data, avg_conf_all, avg_conf_1, avg_conf_0 = create_bin_data_table(industry_df)
+        data = [bin_data.columns.tolist()] + bin_data.values.tolist()
+        table = Table(data)
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+        ]))
+        industry_name = sic_mapping.get(int(industry), f'Industry {int(industry)}')
+        elements.append(PageBreak())  # Add a page break before each industry table
+        elements.append(Paragraph(f'Data Table for {industry_name}', styles['Title']))
+        elements.append(table)
+        elements.append(Spacer(1, 12))  # Add space between tables
+        elements.append(Paragraph(f'Average Confidence Score: {avg_conf_all:.2f}', styles['Normal']))
+        elements.append(Paragraph(f'Average Confidence Score (Predicted 1): {avg_conf_1:.2f}', styles['Normal']))
+        elements.append(Paragraph(f'Average Confidence Score (Predicted 0): {avg_conf_0:.2f}', styles['Normal']))
+
+    doc.build(elements)
+# Function to add images to the PDF
+def add_images_to_pdf(c, images, titles):
+    width, height = landscape(letter)
+
+    for image, title in zip(images, titles):
+        c.drawImage(str(image), 50, 50, width - 100, height - 100)  # Adjust the position and size of the image as needed
+        c.showPage()
+
+    c.save()
+
+# Function to add images and tables to the PDF
+def add_images_and_tables_to_pdf(pdf_path, images, titles, table_pdf_path):
+    c = canvas.Canvas(str(pdf_path), pagesize=landscape(letter))
+    width, height = landscape(letter)
+
+    for image, title in zip(images, titles):
+        c.drawImage(str(image), 50, 50, width - 100, height - 100)
+        c.showPage()
+
+    c.save()
+
+    # Add tables to a separate PDF
+    add_tables_to_pdf(table_pdf_path, df)
+
+
+# Collect all histogram images and titles
+# Collect all histogram images and titles
+# Collect all histogram images and titles
+images = [str(data_dir / 'all_industries_histogram.png')] + [str(data_dir / f'{sic_mapping.get(int(industry), f"Industry {int(industry)}")}_histogram.png') for industry in industries]
+titles = ['Histogram for All Industries'] + [f'Histogram for {sic_mapping.get(int(industry), f"Industry {int(industry)}")}' for industry in industries]
+
+# Create the PDF with both images and tables
+table_pdf_path = str(Path(output_pdf_path).with_name("bin_data_report.pdf"))
+add_images_and_tables_to_pdf(str(output_pdf_path), images, titles, table_pdf_path)
+
+
+from PyPDF2 import PdfMerger, PdfFileReader
+
+# Paths for the two PDFs
+histogram_pdf_path = str(output_pdf_path)
+bin_data_pdf_path = str(Path(output_pdf_path).with_name("bin_data_report.pdf"))
+
+# Output path for the combined PDF
+combined_pdf_path = str(Path(output_pdf_path).with_name("combined_report.pdf"))
+
+# Create a PdfMerger object
+merger = PdfMerger()
+
+# Open the histogram and bin data PDFs
+with open(histogram_pdf_path, 'rb') as histogram_pdf, open(bin_data_pdf_path, 'rb') as bin_data_pdf:
+    # Append pages from each PDF alternately
+    histogram_reader = PdfReader(histogram_pdf)
+    bin_data_reader = PdfReader(bin_data_pdf)
+    
+    max_pages = max(len(histogram_reader.pages), len(bin_data_reader.pages))
+    
+    for i in range(max_pages):
+        if i < len(histogram_reader.pages):
+            merger.append(histogram_reader, pages=(i, i+1))
+        if i < len(bin_data_reader.pages):
+            merger.append(bin_data_reader, pages=(i, i+1))
+    
+    # Write out the merged PDF
+    with open(combined_pdf_path, 'wb') as output_pdf:
+        merger.write(output_pdf)
+
+print(f"Combined PDF saved to {combined_pdf_path}")
