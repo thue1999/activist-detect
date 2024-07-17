@@ -1,0 +1,587 @@
+import logging
+from pathlib import Path
+from datetime import datetime
+import pickle
+import sys
+import subprocess
+import pkg_resources
+import time
+import joblib
+
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_auc_score
+from sklearn.neighbors import NearestNeighbors
+from sklearn.pipeline import Pipeline
+import pandas as pd
+import xgboost as xgb
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.neighbors import NearestNeighbors
+from sklearn.pipeline import Pipeline
+
+# Function to install a package if it's not already installed
+def install_package(package):
+    try:
+        pkg_resources.get_distribution(package)
+    except pkg_resources.DistributionNotFound:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+install_package("openpyxl")
+
+import numpy as np
+import xgboost as xgb
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.neighbors import NearestNeighbors
+from sklearn.pipeline import Pipeline
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Paths and file names
+data_dir = Path(r"C:\Users\16036\OneDrive\Desktop\Investor Sight\Vulnerability\Model")
+stata_dir = data_dir
+output_dir = data_dir
+#data_file = "activist_targeting_2024_07_15.dta"
+data_file = "Merged_dataset-2024-04-04.dta"
+
+target_file = data_dir / "test_data2_2022.xlsx"
+
+# Constants
+TARGET_VAR = "F1_Factset_activism"
+INDUSTRY_VAR = "sic_1_digit"
+CLUSTER_ON = ["ln_mkv"]
+CUTOFF_YEAR = 2014
+MODEL_LABEL = "xgb"
+NEIGHBORS_MAPPING = {
+    9: 36,
+    8: 66,
+    2: 199,
+    4: 12,
+    6: 134,
+    7: 95,
+    3: 149,
+    1: 88,
+    5: 1,
+    0: 84
+}
+
+
+DATA_FIELDS = [
+    "ticker",  
+    TARGET_VAR,
+    INDUSTRY_VAR,
+    #"sic_2_digit",
+    #"sic_3_digit",
+    "year",
+    "gvkey",
+    "ln_mkv",
+    "activist_share_pct",
+    #"differentvotingrightshare",
+    #"supermajorityvoterequirement",
+    "avg_networksize",
+    "avg_support_director",
+    "avg_support_management",
+    "board_independent_ratio",
+    "cash_holding",
+    "ceo_turnover",    
+    "ceo_appoint",
+    "ctype1",
+    "ctype2",
+    "ctype4",
+    "ctype21",
+    "current_ratio",
+    "debt_ratio",
+    "ded_pct",
+    "instown_hhi",
+    "intan_ratio",
+    "num_rec",
+    "prstkc",
+    "ln_at",
+    "ln_capx",
+    "ln_rd",
+    "ln_xad",
+    "risk_taking_value",
+    "roa",
+    "roa_2",
+    "roa_3",
+    "roe",
+    "roe_2",
+    "roe_3",
+    "short_ratio",
+    "stock_ret",
+    "tobin_q",
+    "tra_pct",
+    "w_environment",
+    "w_governance",
+    "w_social",
+    "xsga_ratio",
+    "yearfounded",
+    "t_num_employees"
+]
+
+
+DATA_FIELDS = list(dict.fromkeys(DATA_FIELDS))
+ID_FIELDS = DATA_FIELDS[:5]
+
+# Hyperparameters for XGBoost
+param_grid = {
+    'colsample_bytree': 0.9,
+    'gamma': 0.2,
+    'learning_rate': 0.2,
+    'max_depth': 3,
+    'min_child_weight': 1,
+    'n_estimators': 100,
+    'reg_alpha': 0.1,
+    'reg_lambda': 0,
+    'subsample': 0.8
+}
+
+
+# SIC 1 Digit mapping
+sic_mapping = {
+    0: "Agriculture",
+    1: "Mining",
+    2: "Construction",
+    3: "Manufacturing",
+    4: "Transportation, Communications, Electric, Gas, and Sanitary Services",
+    5: "Wholesale Trade",
+    6: "Retail Trade",
+    7: "Finance, Insurance, and Real Estate",
+    8: "Services",
+    9: "Public Administration",
+    "ALL": "ALL"
+}
+
+class DataProcessor:
+    def __init__(self, data_file, data_fields, id_fields, cutoff_year=CUTOFF_YEAR):
+        self.data_file = data_file
+        self.data_fields = data_fields
+        self.id_fields = id_fields
+        self.cutoff_year = cutoff_year
+        logging.info(f"DataProcessor initialized with {self.data_file}")
+
+    def prepare_data(self, data):
+        # Log the initial data state
+        start_rows = len(data)
+        logging.info("Removing rows with missing 'ln_mkv'")
+
+        # Drop rows where 'ln_mkv' is NaN
+        data = data.dropna(subset=['ln_mkv'])
+        
+        # Log how many rows were dropped
+        end_rows = len(data)
+        logging.info(f"Dropped {start_rows - end_rows} rows due to missing 'ln_mkv'")
+
+        return data
+
+    def load_data(self):
+        logging.info(f"Reading {self.data_file} into a DataFrame")
+        df = pd.read_stata(self.data_file)
+        logging.info(f"Data loaded with {df.shape[0]} rows and {df.shape[1]} columns")
+        df.to_csv(output_dir / "raw_data2.csv", index=False)
+        df = df[self.data_fields]
+        logging.info(f"Data filtered for {len(self.data_fields)} fields")
+
+        logging.info(f"Data filtered for year >= {self.cutoff_year}")
+        df = df[df["year"] >= self.cutoff_year]
+
+        logging.info("Preparation and filtering complete, proceeding without removing missing values.")
+        df = self.prepare_data(df)
+        return df
+
+
+class DataMatcher(BaseEstimator, TransformerMixin):
+    def __init__(self, target_var, id_fields, group_fields=[INDUSTRY_VAR, 'year'], cluster_on=['ln_mkv'], neighbors=1):
+        self.target_var = target_var
+        self.id_fields = id_fields
+        self.group_fields = group_fields
+        self.cluster_on = cluster_on
+        self.nearest_neighbors = neighbors
+
+    def create_groups(self, df):
+        groups = df.groupby(self.group_fields, group_keys=False, observed=False)
+        return groups
+
+    def match_simple(self, group):
+        logging.info(f"Matching in group with size: {len(group)}")
+        minority = group[group[self.target_var] == 1]
+        majority = group[group[self.target_var] == 0]
+
+        if minority.empty or majority.empty:
+            logging.info("Insufficient data for matching in this group.")
+            return pd.DataFrame()
+
+        nn = NearestNeighbors(n_neighbors=min(len(majority), self.nearest_neighbors))
+        nn.fit(majority[self.cluster_on])
+        distances, indices = nn.kneighbors(minority[self.cluster_on])
+        matched_majority_indices = indices.flatten()
+
+        matched_majority = majority.iloc[matched_majority_indices]
+        matched_samples = pd.concat([minority, matched_majority]).drop_duplicates()
+
+        logging.info(f"Matched samples size: {len(matched_samples)}")
+        return matched_samples
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        groups = self.create_groups(X)
+        matched_samples = pd.DataFrame()
+        for name, group in groups:
+            matched_group = self.match_simple(group)
+            matched_samples = pd.concat([matched_samples, matched_group], ignore_index=True)
+        logging.info(f"Total matched data size after processing all groups: {len(matched_samples)}")
+        return matched_samples
+
+def train_and_save_model(train_features, train_labels, pipeline, industry, neighbors):
+
+    # Train the model
+    pipeline.fit(train_features, train_labels)
+
+    # Save the model
+    model_filename = output_dir / f"model2_sic_{int(industry)}_neighbors_{neighbors}.pkl"
+    joblib.dump(pipeline, model_filename)
+    logging.info(f"Model saved for {industry} industry with {neighbors} neighbors")
+
+    # Save the feature names
+    feature_names_filename = output_dir / f"feature_names2_sic_{int(industry)}_neighbors_{neighbors}.pkl"
+    with open(feature_names_filename, 'wb') as f:
+        pickle.dump(train_features.columns.tolist(), f)
+    logging.info(f"Feature names saved for {industry} industry with {neighbors} neighbors")
+
+
+
+def predict_confidence_scores(test_data, sic_mapping):
+    results = []
+
+    for idx, row in test_data.iterrows():
+        industry = row[INDUSTRY_VAR]
+        neighbors = NEIGHBORS_MAPPING.get(industry, 1)
+        model_filename = output_dir / f"model2_sic_{int(industry)}_neighbors_{neighbors}.pkl"
+
+        if not model_filename.exists():
+            logging.warning(f"No model found for {industry} industry with {neighbors} neighbors")
+            continue
+
+        # Load the model
+        model = joblib.load(model_filename)
+
+        # Prepare the data for prediction
+        row_features = row.drop([TARGET_VAR, INDUSTRY_VAR]).values.reshape(1, -1)
+
+        # Predict the confidence score
+        confidence_score = model.predict_proba(row_features)[0, 1]  # Assuming binary classification
+        results.append((row['gvkey'], industry, confidence_score))
+
+    return results
+
+def generate_sample_weights(train_features, weight_feature, base_weight=1, weight_factor=1):
+    # Generate sample weights: higher values of `weight_feature` get higher weights
+    return train_features[weight_feature].apply(lambda x: base_weight if x == 0 else (x ** weight_factor))
+
+def train_and_save_model_with_weights(train_features, train_labels, pipeline, industry, neighbors, weight_feature, base_weight, weight_factor):
+    # Generate sample weights based on the value of the important feature
+    sample_weights = generate_sample_weights(train_features, weight_feature, base_weight, weight_factor)
+    
+    # Train the model with sample weights
+    pipeline.named_steps[MODEL_LABEL].fit(train_features, train_labels, sample_weight=sample_weights)
+    
+    # Save the model
+    model_filename = output_dir / f"model2_sic_{int(industry)}_neighbors_{neighbors}.pkl"
+    joblib.dump(pipeline, model_filename)
+    logging.info(f"Model saved for {industry} industry with {neighbors} neighbors")
+
+    # Save the feature names
+    feature_names_filename = output_dir / f"feature_names2_sic_{int(industry)}_neighbors_{neighbors}.pkl"
+    with open(feature_names_filename, 'wb') as f:
+        pickle.dump(train_features.columns.tolist(), f)
+    logging.info(f"Feature names saved for {industry} industry with {neighbors} neighbors")
+
+
+
+# Function to calculate market cap category from ln_mkv
+def market_cap_category(ln_mkv):
+    mkv = np.exp(ln_mkv)
+    if mkv >= 10**10:
+        return "Large Cap (>$10B)"
+    elif 2 * 10**9 <= mkv < 10**10:
+        return "Mid Cap ($2B-$10B)"
+    elif 250 * 10**6 <= mkv < 2 * 10**9:
+        return "Small Cap ($250M-$2B)"
+    elif 50 * 10**6 <= mkv < 250 * 10**6:
+        return "Micro Cap ($50M-$250M)"
+    else:
+        return "Unknown"
+
+# Function to calculate feature influence
+def feature_influence(feature_value, feature_name):
+    # Example logic for determining influence
+    return feature_value
+
+# Function to calculate confusion matrix and metrics for a given threshold and mask
+def calculate_confusion_matrix_and_metrics(threshold, mask, true_labels, predicted_probabilities):
+    if not predicted_probabilities:  # If the list is empty, return an empty confusion matrix
+        return np.array([]), {}
+    filtered_true_labels = np.array(true_labels)[mask]
+    filtered_predicted_probabilities = np.array(predicted_probabilities)[mask]
+    thresholded_predictions = [1 if prob >= threshold else 0 for prob in filtered_predicted_probabilities]
+    conf_matrix = confusion_matrix(filtered_true_labels, thresholded_predictions)
+    metrics = {
+        'accuracy': accuracy_score(filtered_true_labels, thresholded_predictions),
+        'precision': precision_score(filtered_true_labels, thresholded_predictions, average=None),
+        'recall': recall_score(filtered_true_labels, thresholded_predictions, average=None),
+        'f1_score': f1_score(filtered_true_labels, thresholded_predictions, average=None),
+        #'auc_roc': roc_auc_score(filtered_true_labels, filtered_predicted_probabilities)  # Add AUC ROC here
+    }
+    return conf_matrix, metrics
+
+# Function to calculate AUC ROC and best F1 score
+# Function to calculate AUC ROC and best F1 score
+def calculate_auc_and_best_f1(mask, true_labels, predicted_probabilities, thresholds):
+    if not predicted_probabilities:  # If the list is empty, return default values
+        return 0.0, 0.0, 0.0, 0, 0, 0, 0
+
+    filtered_true_labels = np.array(true_labels)[mask]
+    filtered_predicted_probabilities = np.array(predicted_probabilities)[mask]
+
+    # Check if there are both classes in the true labels
+    if len(np.unique(filtered_true_labels)) == 1:
+        logging.warning("Only one class present in y_true. ROC AUC score is not defined in that case.")
+        auc = 0.0
+    else:
+        auc = roc_auc_score(filtered_true_labels, filtered_predicted_probabilities)
+
+    best_f1 = 0.0
+    best_threshold = 0.0
+    best_recall = 0.0
+    best_accuracy = 0.0
+    best_precision = 0.0
+    for threshold in thresholds:
+        _, metrics = calculate_confusion_matrix_and_metrics(threshold, mask, true_labels, predicted_probabilities)
+        f1_class_1 = metrics['f1_score'][1] if 'f1_score' in metrics and len(metrics['f1_score']) > 1 else 0.0
+        if f1_class_1 > best_f1:
+            best_f1 = f1_class_1
+            best_accuracy = metrics['accuracy']
+            best_recall = metrics['recall'][1] if 'recall' in metrics and len(metrics['recall']) > 1 else 0.0
+            best_precision = metrics['precision'][1] if 'precision' in metrics and len(metrics['precision']) > 1 else 0.0
+            best_threshold = threshold
+    
+    number_points = np.sum(mask)
+
+    return auc, best_f1, best_threshold, number_points, best_recall, best_accuracy, best_precision
+
+
+# Function to calculate top N hit rates
+def calculate_top_n_hit_rate(df, n):
+    sorted_df = df.sort_values(by='Confidence Score', ascending=False)  # Sort the entire DataFrame
+    top_n = sorted_df.head(n)  # Select the top N rows
+    hit_rate = (top_n[TARGET_VAR] == 1).mean()  # Convert to percentage
+    return hit_rate
+
+
+def main():
+    stata_file_path = stata_dir / data_file
+    logging.info(f"Loading data from {stata_file_path}")
+
+    df = DataProcessor(stata_file_path, DATA_FIELDS, ID_FIELDS, cutoff_year=CUTOFF_YEAR).load_data()
+
+    # Separate the data from 2022 as the testing set and save it as CSV
+    test_data = df[df['year'] == 2022.0]
+    train_data = df[df['year'] != 2022.0]
+    test_data.to_excel(output_dir / "test_data2_2022.xlsx", index=False)
+
+    # Process each industry within the training data
+    industries = train_data[INDUSTRY_VAR].unique()
+    for industry in sorted(industries):
+        logging.info(f"Running model on {sic_mapping[industry]} industry")
+        df_industry = train_data[train_data[INDUSTRY_VAR] == industry]
+
+        neighbors = NEIGHBORS_MAPPING.get(industry, 1)  # Default to 1 neighbor if not specified
+        matched_train_data = DataMatcher(target_var=TARGET_VAR, id_fields=ID_FIELDS, cluster_on=CLUSTER_ON, neighbors=neighbors).fit_transform(df_industry)
+
+        if matched_train_data.empty:
+            logging.warning(f"No matched data for {sic_mapping[industry]} industry with {neighbors} neighbors")
+            continue
+
+        train_labels = matched_train_data[TARGET_VAR]
+        train_to_auto = matched_train_data
+        train_to_auto.to_csv(output_dir / f"matched_train2_data_{sic_mapping[industry]}.csv", index=False)
+        train_features = matched_train_data.drop([TARGET_VAR, INDUSTRY_VAR], axis=1)
+        train_features = train_features.drop(columns=["ticker"])
+
+        # Define the important feature and weight factor
+        #important_feature = 'ceo_turnover'
+        #base_weight = 1
+        #weight_factor = 1
+
+        pipeline = Pipeline([(MODEL_LABEL, xgb.XGBClassifier(**param_grid))])
+        #train_and_save_model_with_weights(train_features, train_labels, pipeline, industry, neighbors, important_feature, base_weight, weight_factor)
+        train_and_save_model(train_features, train_labels, pipeline, industry, neighbors)
+
+    
+    
+    # Load the confidence scores
+    target_df = pd.read_excel(target_file)
+    target_scores = target_df["F1_Factset_activism"]
+
+    test_data = pd.read_excel(output_dir / "test_data2_2022.xlsx")
+
+    # Take a few rows from the test set for prediction
+    # test_sample = test_data.sample(n=10, random_state=42)
+
+    test_sample = test_data
+    #test_sample.to_excel(output_dir / "test_sample2.xlsx", index=False)
+
+    # Predict confidence scores
+    confidence_scores = []
+    true_labels = []
+    predicted_labels = []
+    predicted_probabilities = []
+    industries = []
+
+    for _, row in test_sample.iterrows():
+        industry = row[INDUSTRY_VAR]
+        industries.append(industry)
+        model_filename = output_dir / f"model2_sic_{int(industry)}_neighbors_{NEIGHBORS_MAPPING[industry]}.pkl"
+        feature_names_filename = output_dir / f"feature_names2_sic_{int(industry)}_neighbors_{NEIGHBORS_MAPPING[industry]}.pkl"
+
+        if not model_filename.exists() or not feature_names_filename.exists():
+            logging.warning(f"No model or feature names found for {sic_mapping[industry]} industry with {NEIGHBORS_MAPPING[industry]} neighbors")
+            continue
+
+        with open(model_filename, 'rb') as model_file:
+            model = pickle.load(model_file)
+        with open(feature_names_filename, 'rb') as f:
+            feature_names = pickle.load(f)
+
+        features = row.drop([TARGET_VAR])
+        features = features.reindex(feature_names, axis=1)
+        confidence_score = model.predict_proba(features.values.reshape(1, -1))[0][1]  # Probability of class 1
+        predicted_label = model.predict(features.values.reshape(1, -1))[0]  # Predicted label
+
+        # Create dictionary for current row
+        row_dict = {
+            "Ticker": row['ticker'],
+            "Gvkey": row['gvkey'],
+            "Confidence Score": confidence_score,
+            "SIC 1 digit name": sic_mapping[industry],
+            "SIC 1 digit": row[INDUSTRY_VAR],
+            #"SIC 2 digit": row['sic_2_digit'],
+            #"SIC 3 digit": row['sic_3_digit'],
+            "Market Cap Category": market_cap_category(row['ln_mkv']),
+            "Vulnerability": "High" if confidence_score >= 0.5 else "Mid" if confidence_score >= 0.2 else "Low"
+        }
+
+        # Add feature influences
+        for feature in feature_names:
+            row_dict[f"{feature}"] = feature_influence(row[feature], feature)
+
+        confidence_scores.append(row_dict)
+
+        true_labels.append(row[TARGET_VAR])
+        predicted_labels.append(predicted_label)
+        predicted_probabilities.append(confidence_score)
+
+    # Convert confidence scores to DataFrame
+    confidence_scores_df = pd.DataFrame(confidence_scores)
+    max = len(confidence_scores_df)
+    # Calculate top N hit rates
+    top_n_values = [10, 20, 30, 50, 100, max]
+    hit_rates = {f'Top {n} Hit Rate': [] for n in top_n_values}
+
+    confidence_scores_df.insert(2, "F1_Factset_activism", target_scores)
+
+    for industry in set(industries):
+        industry_df = confidence_scores_df[confidence_scores_df['SIC 1 digit'] == industry]
+        for n in top_n_values:
+            hit_rate = calculate_top_n_hit_rate(industry_df, n)
+            hit_rates[f'Top {n} Hit Rate'].append(hit_rate)
+    
+    # Calculate combined hit rates
+    for n in top_n_values:
+        hit_rate = calculate_top_n_hit_rate(confidence_scores_df, n)
+        hit_rates[f'Top {n} Hit Rate'].append(hit_rate)
+
+    # Save hit rates to DataFrame
+    hit_rates_df = pd.DataFrame(hit_rates)
+    hit_rates_df['Industry'] = list(set(industries)) + ['Combined']
+
+    # Save results to Excel
+    thresholds = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
+    auc_roc_scores = []
+    best_f1_scores = []
+
+    with pd.ExcelWriter(output_dir / "confidence_scoresnew2.xlsx") as writer:
+        confidence_scores_df.to_excel(writer, sheet_name="Confidence Scores", index=False)
+
+        # Define combined_mask
+        combined_mask = [True] * len(true_labels)
+
+        # Calculate and save AUC ROC scores and best F1 scores to the second sheet
+        auc, best_f1, best_threshold, number_points, best_recall, best_accuracy, best_precision = calculate_auc_and_best_f1(combined_mask, true_labels, predicted_probabilities, thresholds)
+        combined_hit_rates = {f'Top {n} Hit Rate': hit_rates[f'Top {n} Hit Rate'][-1] for n in top_n_values}
+        auc_roc_scores.append({"Industry": "Combined", "AUC ROC": auc, "Best F1 1 Score": best_f1, "Best Precision 1": best_precision, "Best Recall 1": best_recall, "Best Accuracy": best_accuracy, "Number of Data Points": number_points, "Best Threshold": best_threshold, **combined_hit_rates})
+
+        for industry in set(industries):
+            industry_mask = [i == industry for i in industries]
+            auc, best_f1, best_threshold, number_points, best_recall, best_accuracy, best_precision = calculate_auc_and_best_f1(industry_mask, true_labels, predicted_probabilities, thresholds)
+            industry_hit_rates = {f'Top {n} Hit Rate': hit_rates[f'Top {n} Hit Rate'][list(set(industries)).index(industry)] for n in top_n_values}
+            auc_roc_scores.append({"Industry": sic_mapping[industry], "AUC ROC": auc, "Best F1 1 Score": best_f1, "Best Precision 1": best_precision, "Best Recall 1": best_recall, "Best Accuracy": best_accuracy, "Number of Data Points": number_points, "Best Threshold": best_threshold, **industry_hit_rates})
+
+        auc_roc_df = pd.DataFrame(auc_roc_scores)
+        
+        # Calculate weighted averages (excluding "Combined")
+        total_points_excluding_combined = auc_roc_df.loc[auc_roc_df["Industry"] != "Combined", "Number of Data Points"].sum()
+        weighted_avg = {
+            "Industry": "Weighted Average",
+            "AUC ROC": (auc_roc_df.loc[auc_roc_df["Industry"] != "Combined", "AUC ROC"] * auc_roc_df.loc[auc_roc_df["Industry"] != "Combined", "Number of Data Points"]).sum() / total_points_excluding_combined,
+            "Best F1 1 Score": (auc_roc_df.loc[auc_roc_df["Industry"] != "Combined", "Best F1 1 Score"] * auc_roc_df.loc[auc_roc_df["Industry"] != "Combined", "Number of Data Points"]).sum() / total_points_excluding_combined,
+            "Best Precision 1": (auc_roc_df.loc[auc_roc_df["Industry"] != "Combined", "Best Precision 1"] * auc_roc_df.loc[auc_roc_df["Industry"] != "Combined", "Number of Data Points"]).sum() / total_points_excluding_combined,
+            "Best Recall 1": (auc_roc_df.loc[auc_roc_df["Industry"] != "Combined", "Best Recall 1"] * auc_roc_df.loc[auc_roc_df["Industry"] != "Combined", "Number of Data Points"]).sum() / total_points_excluding_combined,
+            "Best Accuracy": (auc_roc_df.loc[auc_roc_df["Industry"] != "Combined", "Best Accuracy"] * auc_roc_df.loc[auc_roc_df["Industry"] != "Combined", "Number of Data Points"]).sum() / total_points_excluding_combined,
+            "Number of Data Points": total_points_excluding_combined,
+            "Best Threshold": (auc_roc_df.loc[auc_roc_df["Industry"] != "Combined", "Best Threshold"] * auc_roc_df.loc[auc_roc_df["Industry"] != "Combined", "Number of Data Points"]).sum() / total_points_excluding_combined,
+        }
+        
+        for n in top_n_values:
+            weighted_avg[f'Top {n} Hit Rate'] = (auc_roc_df.loc[auc_roc_df["Industry"] != "Combined", f'Top {n} Hit Rate'] * auc_roc_df.loc[auc_roc_df["Industry"] != "Combined", "Number of Data Points"]).sum() / total_points_excluding_combined
+
+        # Append weighted averages row to DataFrame
+        auc_roc_df = pd.concat([auc_roc_df, pd.DataFrame([weighted_avg])], ignore_index=True)
+
+        # Format columns to percentage with 2 decimal places
+        percentage_columns = ["AUC ROC", "Best F1 1 Score", "Best Precision 1", "Best Recall 1", "Best Accuracy"] + [f'Top {n} Hit Rate' for n in top_n_values]
+        auc_roc_df[percentage_columns] = auc_roc_df[percentage_columns].applymap(lambda x: f"{x:.2f}")
+
+
+        auc_roc_df.to_excel(writer, sheet_name="AUC ROC", index=False, startrow=0, startcol=0)
+
+        # Calculate and save combined results (without splitting by industry)
+        for threshold in thresholds:
+            conf_matrix, metrics = calculate_confusion_matrix_and_metrics(threshold, combined_mask, true_labels, predicted_probabilities)
+            if conf_matrix.size != 0:  # If confusion matrix is not empty
+                sheet_name = f"Combined {int(threshold*100)}%"
+                conf_matrix_df = pd.DataFrame(conf_matrix, index=["Actual 0", "Actual 1"], columns=["Predicted 0", "Predicted 1"])
+                conf_matrix_df.to_excel(writer, sheet_name=sheet_name, startrow=0, startcol=0)
+
+                metrics_df = pd.DataFrame(metrics, index=["Class 0", "Class 1"])
+                metrics_df.to_excel(writer, sheet_name=sheet_name, startrow=conf_matrix_df.shape[0] + 3, startcol=0)
+
+        # Iterate over each industry and save their confusion matrices and metrics
+        for industry in set(industries):
+            industry_mask = [i == industry for i in industries]
+            for threshold in thresholds:
+                conf_matrix, metrics = calculate_confusion_matrix_and_metrics(threshold, industry_mask, true_labels, predicted_probabilities)
+                if conf_matrix.size != 0:  # If confusion matrix is not empty
+                    sheet_name = f"{sic_mapping[industry]} {int(threshold*100)}%"
+                    conf_matrix_df = pd.DataFrame(conf_matrix, index=["Actual 0", "Actual 1"], columns=["Predicted 0", "Predicted 1"])
+                    conf_matrix_df.to_excel(writer, sheet_name=sheet_name, startrow=0, startcol=0)
+
+                    metrics_df = pd.DataFrame(metrics, index=["Class 0", "Class 1"])
+                    metrics_df.to_excel(writer, sheet_name=sheet_name, startrow=conf_matrix_df.shape[0] + 3, startcol=0)
+
+
+if __name__ == "__main__":
+    main()
+
